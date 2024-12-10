@@ -13,7 +13,7 @@ from models.file_model import FileModel
 
 class FileManager:
     MAX_STORAGE_PER_USER = 50 * 1024 * 1024
-    MAX_FILE_SIZE = 4 * 1024 * 1024
+    MAX_FILE_SIZE = 10 * 1024 * 1024
     
     def __init__(self):
         self.STORAGE_PATH = os.path.abspath(Config.STORAGE_PATH)

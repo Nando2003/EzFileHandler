@@ -25,12 +25,15 @@ class EzFileHandler:
     def __init__(self):
         self.application = Application.builder()\
             .token(Config.TOKEN)\
+            .read_timeout(30)\
+            .write_timeout(30)\
+            .connect_timeout(30)\
+            .pool_timeout(30)\
             .build()
         
         self.user_initialized = {}
-        self.user_upload_time = {}
+        self.user_upload_states = {}
         self.file_manager = FileManager()
-        self.handler_activated = False
     
     def setup_handlers(self):
         self.application.add_handler(CommandHandler('start', self.start))
@@ -45,6 +48,7 @@ class EzFileHandler:
     
     def not_start_message(self, user_id: int):
         if user_id not in self.user_initialized or not self.user_initialized[user_id]:
+            logger.warning(f'User {user_id} tried to access without initialization.')
             return 'Digite /start para começar!'
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,8 +62,9 @@ class EzFileHandler:
     
     async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message and (user := update.message.from_user):
+            logger.info(f'User {user.id} accessed /menu.')
             if message := self.not_start_message(user.id):
-                await update.message.reply_text(message) # type: ignore
+                await update.message.reply_text(message)  # type: ignore
             
             else:
                 keyboard = [
@@ -74,9 +79,10 @@ class EzFileHandler:
                 )
     
     async def file_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_name: str):
+        logger.info(f'File menu accessed for file: {file_name}')
         if update.callback_query and (user := update.callback_query.from_user):
             if message := self.not_start_message(user.id):
-                await update.callback_query.message.reply_text(message) # type: ignore
+                await update.callback_query.message.reply_text(message)  # type: ignore
                 
             else:
                 keyboard = [
@@ -94,11 +100,13 @@ class EzFileHandler:
     
     async def upload_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message and (user := update.message.from_user):
+            logger.info(f'User {user.id} attempted to upload a file.')
             if message := self.not_start_message(user.id):
                 await update.message.reply_text(message)
                 
             else:
-                if not self.handler_activated:
+                if not self.user_upload_states.get(user.id, False):
+                    logger.warning(f'User {user.id} tried to upload without permission.')
                     await update.message.reply_text(
                         "Clique em <i>'Enviar Arquivo'</i> no <strong><i>/menu</i></strong> para enviar um arquivo.",
                         parse_mode="HTML"
@@ -106,6 +114,7 @@ class EzFileHandler:
                     return
                 
                 if upload_file := update.message.document:
+                    logger.info(f'Processing file upload: {upload_file.file_name}')
                     processing_message = await update.message.reply_text(
                         "Processando...",
                         parse_mode="HTML"
@@ -123,121 +132,141 @@ class EzFileHandler:
                             
                             success = await self.file_manager.save_upload_file(upload_file, context.bot, user)
 
-                        if success:
+                        if success == 0:
+                            logger.info(f'File {upload_file.file_name} uploaded successfully.')
                             await processing_message.edit_text("Arquivo carregado com sucesso!")
-                            self.application.remove_handler(self.file_handler)
-                            self.handler_activated = False
                     
                     except Exception as e:
+                        logger.error(f'Error during file upload: {str(e)}')
                         await processing_message.edit_text(f"Erro: {str(e)}")
-    
+
+                    self.user_upload_states[user.id] = False
+                    
     async def download_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_name: str):
+        logger.info(f'User requested to download file: {file_name}')
         if update.callback_query and (user := update.callback_query.from_user):
             if message := self.not_start_message(user.id):
-                await update.callback_query.message.reply_text(message) # type: ignore
+                await update.callback_query.message.reply_text(message)  # type: ignore
                 
             else:
                 success = await self.file_manager.download_file(context.bot, user, file_name)
                 
                 if success:
+                    logger.info(f'File {file_name} downloaded successfully.')
                     await update.callback_query.answer()
                 else:
+                    logger.warning(f'Failed to download file: {file_name}')
                     await update.callback_query.answer()
-                    await update.callback_query.message.reply_text( # type: ignore
+                    await update.callback_query.message.reply_text(  # type: ignore
                         f"<b>Erro:</b> não foi possível encontrar o arquivo <b><i>{file_name}</i></b>.",
                         parse_mode="HTML"
                     )
 
     async def list_user_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info('Listing user files.')
         if update.callback_query and (user := update.callback_query.from_user):
             if message := self.not_start_message(user.id):
-                await update.callback_query.message.reply_text(message) # type: ignore
+                await update.callback_query.message.reply_text(message)  # type: ignore
                 
             else:
-                files = await self.file_manager.list_user_files(user)
-                
-                if files:
-                    keyboard = [
-                        [InlineKeyboardButton(f'{file.file_name} - {FileModel.format_file_size(file.file_size)}', callback_data=f'file_{file.file_name}')] for file in files
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    total_user_size = self.file_manager.get_user_storage_usage(user.id)
+                try:
+                    files = await self.file_manager.list_user_files(user)
+                    logger.info(f'Found {len(files)} files for user {user.id}.')
                     
-                    await update.callback_query.message.reply_text( # type: ignore
-                        f"<b>{user.first_name}</b>, seus arquivos são esses: \n<i>Espaço disponível: <b>{FileModel.format_file_size(total_user_size)}/50.00 MB</b></i>", 
-                        reply_markup=reply_markup,
-                        parse_mode="HTML"
-                    ) 
-                else:
-                    await update.callback_query.message.reply_text("Nenhum arquivo encontrado.") # type: ignore
+                    if files:
+                        keyboard = [
+                            [InlineKeyboardButton(f'{file.file_name} - {FileModel.format_file_size(file.file_size)}', callback_data=f'file_{file.file_name}')] for file in files
+                        ]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        total_user_size = self.file_manager.get_user_storage_usage(user.id)
+                        
+                        await update.callback_query.message.reply_text(  # type: ignore
+                            f"<b>{user.first_name}</b>, seus arquivos são esses: \n<i>Espaço disponível: <b>{FileModel.format_file_size(total_user_size)}/50.00 MB</b></i>", 
+                            reply_markup=reply_markup,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        logger.info(f'No files found for user {user.id}.')
+                        await update.callback_query.message.reply_text("Nenhum arquivo encontrado.")  # type: ignore
+                except Exception as e:
+                    logger.error(f'Error while listing files for user {user.id}: {str(e)}')
     
     async def remove_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE, file_name: str):
+        logger.info(f'Remove file request for: {file_name}')
         if update.callback_query and (user := update.callback_query.from_user):
             if message := self.not_start_message(user.id):
-                await update.callback_query.message.reply_text(message) # type: ignore
+                await update.callback_query.message.reply_text(message)  # type: ignore
                 
             else:
-                user_size_before = self.file_manager.get_user_storage_usage(user.id)
-                files = await self.file_manager.remove_file(context.bot, user, file_name)
-                
-                if files:
-                    user_size_after = self.file_manager.get_user_storage_usage(user.id)
+                try:
+                    user_size_before = self.file_manager.get_user_storage_usage(user.id)
+                    success = await self.file_manager.remove_file(context.bot, user, file_name)
                     
-                    await update.callback_query.message.reply_text( # type: ignore
-                        f"Arquivo <i><b>{file_name}</b></i>, removido das suas dependencias. \nLimpando o espaço de <i><b>{FileModel.format_file_size(user_size_before - user_size_after)}</b></i>", 
-                        parse_mode="HTML"
-                    ) 
-                else:
-                    await update.callback_query.message.reply_text("Erro ao remover o arquivo.") # type: ignore
+                    if success:
+                        user_size_after = self.file_manager.get_user_storage_usage(user.id)
+                        freed_space = FileModel.format_file_size(user_size_before - user_size_after)
+                        logger.info(f'File {file_name} removed successfully for user {user.id}, freed {freed_space}.')
+                        
+                        await update.callback_query.message.reply_text(  # type: ignore
+                            f"Arquivo <i><b>{file_name}</b></i> removido. \nEspaço liberado: <i><b>{freed_space}</b></i>", 
+                            parse_mode="HTML"
+                        )
+                    else:
+                        logger.warning(f'Failed to remove file {file_name} for user {user.id}.')
+                        await update.callback_query.message.reply_text("Erro ao remover o arquivo.")  # type: ignore
+                except Exception as e:
+                    logger.error(f'Error while removing file {file_name} for user {user.id}: {str(e)}')
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info('Handling callback query.')
         query = update.callback_query
         
         if query:
             await query.answer()
+            logger.info(f'Callback data: {query.data}')
             
-            if query.data == 'upload':
-                if update.callback_query and (user := update.callback_query.from_user):
-                    if message := self.not_start_message(user.id):
-                        await update.callback_query.message.reply_text(message)  # type: ignore
-                    else:
-                        await update.callback_query.message.reply_text(  # type: ignore
-                            "<strong>Por favor, envie o arquivo no chat dentro de 40 segs.</strong>",
-                            parse_mode="HTML"
-                        )
-                        
-                        self.file_handler = MessageHandler(filters.Document.ALL, self.upload_file)
-                        self.application.add_handler(self.file_handler)
-                        self.handler_activated = True
-                        
-                        asyncio.create_task(self.remove_upload_handler_after_timeout(update, self.file_handler))
-                        
-                  
-            elif query.data == 'list_files':
-                await self.list_user_files(update, context)
+            try:
+                if query.data == 'upload':
+                    if update.callback_query and (user := update.callback_query.from_user):
+                        if message := self.not_start_message(user.id):
+                            await update.callback_query.message.reply_text(message)  # type: ignore
+                        else:
+                            self.user_upload_states[user.id] = True
+                            logger.info(f'Upload enabled for user {user.id}.')
+                            
+                            await query.message.reply_text(  # type: ignore
+                                "<strong>Por favor, envie o arquivo no chat dentro de 80 segundos.</strong>",
+                                parse_mode="HTML"
+                            )
+                            
+                            # Desativar permissão após 45 segundos
+                            asyncio.create_task(self.disable_upload_after_timeout(user.id))
+                      
+                elif query.data == 'list_files':
+                    await self.list_user_files(update, context)
+                    
+                elif isinstance(query.data, str) and query.data.startswith('file_'):
+                    file_name = query.data[len('file_'):]
+                    await self.file_menu(update, context, file_name)
                 
-            elif isinstance(query.data, str) and query.data.startswith('file_'):
-                file_name = query.data[len('file_'):]
-                await self.file_menu(update, context, file_name)
-            
-            elif isinstance(query.data, str) and query.data.startswith('download_'):
-                file_name = query.data[len('download_'):]
-                await self.download_file(update, context, file_name)
-                await query.message.delete() # type: ignore
-            
-            elif isinstance(query.data, str) and query.data.startswith('remove_'):
-                file_name = query.data[len('remove_'):]
-                await self.remove_file(update, context, file_name)
-                await query.message.delete() # type: ignore
-            
-            elif query.data == 'back':
-                await query.message.delete() # type: ignore
+                elif isinstance(query.data, str) and query.data.startswith('download_'):
+                    file_name = query.data[len('download_'):]
+                    await self.download_file(update, context, file_name)
+                    await query.message.delete()  # type: ignore
                 
-    async def remove_upload_handler_after_timeout(self, update: Update, file_handler: MessageHandler):
-        await asyncio.sleep(40)
-        self.application.remove_handler(file_handler)
-        self.handler_activated = False 
-        await update.callback_query.message.reply_text(  # type: ignore
-            "Tempo expirado!",
-            parse_mode="HTML"
-        )
+                elif isinstance(query.data, str) and query.data.startswith('remove_'):
+                    file_name = query.data[len('remove_'):]
+                    await self.remove_file(update, context, file_name)
+                    await query.message.delete()  # type: ignore
+                
+                elif query.data == 'back':
+                    logger.info('User selected "Back" option.')
+                    await query.message.delete()  # type: ignore
+            except Exception as e:
+                logger.error(f'Error while handling callback: {str(e)}')
+                
+    async def disable_upload_after_timeout(self, user_id: int):
+        logger.info(f'Setting upload timeout for user {user_id}.')
+        await asyncio.sleep(80)
+        self.user_upload_states[user_id] = False
+        logger.info(f'Upload disabled for user {user_id} after timeout.')
